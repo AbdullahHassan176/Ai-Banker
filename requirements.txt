@@ -1,1 +1,11 @@
-
+pandas>=2.0.0
+numpy>=1.24.0
+tabula-py>=2.5.1
+jpype1>=1.4.0
+sqlalchemy>=2.0.0
+plotly>=5.17.0
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+python-dateutil>=2.8.2
+openai>=1.0.0
+requests>=2.31.0
