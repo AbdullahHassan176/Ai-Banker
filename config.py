@@ -21,6 +21,7 @@ AI_CATEGORIZATION_ENABLED = os.getenv("AI_CATEGORIZATION_ENABLED", "true").lower
 AI_INSIGHTS_ENABLED = os.getenv("AI_INSIGHTS_ENABLED", "true").lower() == "true"
 AI_ANOMALY_DETECTION_ENABLED = os.getenv("AI_ANOMALY_DETECTION_ENABLED", "true").lower() == "true"
 AI_FORECASTING_ENABLED = os.getenv("AI_FORECASTING_ENABLED", "true").lower() == "true"
+AI_TRANSACTION_VALIDATION_ENABLED = os.getenv("AI_TRANSACTION_VALIDATION_ENABLED", "true").lower() == "true"
 
 # Streamlit configuration
 STREAMLIT_THEME = {

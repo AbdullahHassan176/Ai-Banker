@@ -273,6 +273,7 @@ app.layout = html.Div([
             dcc.Link("Anomalies", href="/anomalies", className="nav-link", id="nav-anomalies"),
             dcc.Link("History", href="/history", className="nav-link", id="nav-history"),
             dcc.Link("Wealth & Portfolio", href="/wealth", className="nav-link", id="nav-wealth"),
+            dcc.Link("Transactions", href="/transactions", className="nav-link", id="nav-transactions"),
         ], className='sidebar'),
         
         html.Div([
@@ -728,6 +729,277 @@ def create_wealth_page():
         ], className="chart-container", style={'marginTop': '2rem'})
     ])
 
+def create_transactions_page():
+    """Create a page to view all parsed transactions for debugging"""
+    statements = db.get_statements()
+    
+    if not statements:
+        return html.Div([
+            html.H2("Transactions", className="section-title"),
+            html.P("No statements found. Please upload a bank statement to view transactions.", 
+                  style={'color': '#94a3b8', 'fontSize': '1.1rem'})
+        ])
+    
+    # Get all transactions
+    all_transactions = db.get_transactions()
+    
+    if all_transactions.empty:
+        return html.Div([
+            html.H2("Transactions", className="section-title"),
+            html.P("No transactions found.", style={'color': '#94a3b8', 'fontSize': '1.1rem'})
+        ])
+    
+    # Add statement info to transactions
+    statement_dict = {s.id: s for s in statements}
+    all_transactions['account_name'] = all_transactions['statement_id'].map(
+        lambda x: statement_dict.get(x, None).account_name if statement_dict.get(x) else 'Unknown'
+    )
+    all_transactions['currency'] = all_transactions['statement_id'].map(
+        lambda x: getattr(statement_dict.get(x, None), 'currency', 'ZAR') if statement_dict.get(x) else 'ZAR'
+    )
+    
+    # Prepare data for table
+    transactions_data = []
+    for idx, row in all_transactions.iterrows():
+        currency = row.get('currency', 'ZAR')
+        # Get raw numeric values - use direct column access
+        raw_amount = float(row['amount']) if pd.notna(row.get('amount', None)) else 0.0
+        raw_balance = float(row['balance']) if pd.notna(row.get('balance', None)) else 0.0
+        
+        transactions_data.append({
+            'ID': int(row.get('id', 0)) if pd.notna(row.get('id')) else 0,
+            'Statement ID': int(row.get('statement_id', 0)) if pd.notna(row.get('statement_id')) else 0,
+            'Account': row.get('account_name', 'Unknown'),
+            'Currency': currency,
+            'Date': pd.to_datetime(row['date']).strftime('%Y-%m-%d') if pd.notna(row['date']) else '',
+            'Amount': format_currency(raw_amount, currency),
+            'Amount Raw': raw_amount,  # Raw numeric value for debugging
+            'Balance': format_currency(raw_balance, currency),
+            'Balance Raw': raw_balance,  # Raw numeric value for debugging
+            'CR/DR': row.get('cr_dr_indicator', ''),
+            'Description 1': str(row.get('description_1', ''))[:100] if pd.notna(row.get('description_1')) else '',
+            'Description 2': str(row.get('description_2', ''))[:100] if pd.notna(row.get('description_2')) else '',
+            'Description 3': str(row.get('description_3', ''))[:100] if pd.notna(row.get('description_3')) else '',
+            'Merchant': str(row.get('merchant', ''))[:100] if pd.notna(row.get('merchant')) else '',
+            'Category': str(row.get('merchant_category', '')) if pd.notna(row.get('merchant_category')) else '',
+            'Month': row.get('month_year', ''),
+        })
+    
+    # Statement filter options - Dash doesn't like None values, use empty string instead
+    statement_options = [{'label': 'All Statements', 'value': ''}] + \
+                       [{'label': f"{s.account_name} ({s.period_end.strftime('%Y-%m-%d')})", 'value': s.id} 
+                        for s in statements]
+    
+    # Currency filter options
+    currencies = sorted(set(all_transactions['currency'].unique()))
+    currency_options = [{'label': 'All Currencies', 'value': ''}] + \
+                       [{'label': curr, 'value': curr} for curr in currencies]
+    
+    return html.Div([
+        html.H2("All Transactions", className="section-title"),
+        html.P("View all parsed transactions to identify parsing issues. Use filters to narrow down results.",
+              style={'color': '#94a3b8', 'fontSize': '1rem', 'marginBottom': '2rem'}),
+        
+        # Filters
+        html.Div([
+            html.Div([
+                html.Label("Filter by Statement:", style={'marginRight': '1rem', 'color': '#94a3b8', 'fontWeight': '500'}),
+                dcc.Dropdown(
+                    id='transactions-statement-filter',
+                    options=statement_options,
+                    value='',
+                    style={'width': '300px', 'backgroundColor': 'rgba(255,255,255,0.05)', 'color': '#ffffff'},
+                    clearable=True
+                )
+            ], style={'marginRight': '2rem'}),
+            html.Div([
+                html.Label("Filter by Currency:", style={'marginRight': '1rem', 'color': '#94a3b8', 'fontWeight': '500'}),
+                dcc.Dropdown(
+                    id='transactions-currency-filter',
+                    options=currency_options,
+                    value='',
+                    style={'width': '200px', 'backgroundColor': 'rgba(255,255,255,0.05)', 'color': '#ffffff'},
+                    clearable=True
+                )
+            ], style={'marginRight': '2rem'}),
+            html.Div([
+                html.Label("Filter by CR/DR:", style={'marginRight': '1rem', 'color': '#94a3b8', 'fontWeight': '500'}),
+                dcc.Dropdown(
+                    id='transactions-crdr-filter',
+                    options=[
+                        {'label': 'All', 'value': ''},
+                        {'label': 'Credits (CR)', 'value': 'CR'},
+                        {'label': 'Debits (DR)', 'value': 'DR'}
+                    ],
+                    value='',
+                    style={'width': '150px', 'backgroundColor': 'rgba(255,255,255,0.05)', 'color': '#ffffff'},
+                    clearable=True
+                )
+            ])
+        ], style={'margin': '2rem 0', 'display': 'flex', 'alignItems': 'center', 'flexWrap': 'wrap', 'gap': '1rem'}),
+        
+        # Summary stats
+        html.Div([
+            html.Div([
+                html.Div(f"{len(transactions_data):,}", className="metric-value", style={'fontSize': '1.5rem'}),
+                html.Div("Total Transactions", className="metric-label")
+            ], className="metric-card", style={'padding': '1rem'}),
+            html.Div([
+                html.Div(f"{len(all_transactions[all_transactions['cr_dr_indicator'] == 'CR']):,}", 
+                        className="metric-value", style={'fontSize': '1.5rem', 'color': '#2ecc71'}),
+                html.Div("Credits (CR)", className="metric-label")
+            ], className="metric-card", style={'padding': '1rem'}),
+            html.Div([
+                html.Div(f"{len(all_transactions[all_transactions['cr_dr_indicator'] == 'DR']):,}", 
+                        className="metric-value", style={'fontSize': '1.5rem', 'color': '#e74c3c'}),
+                html.Div("Debits (DR)", className="metric-label")
+            ], className="metric-card", style={'padding': '1rem'}),
+        ], style={'display': 'grid', 'gridTemplateColumns': 'repeat(auto-fit, minmax(200px, 1fr))', 'gap': '1rem', 'margin': '2rem 0'}),
+        
+        # Transactions table - show initial data
+        dash_table.DataTable(
+            id='transactions-table',
+            columns=[
+                {'name': 'ID', 'id': 'ID'},
+                {'name': 'Date', 'id': 'Date'},
+                {'name': 'Account', 'id': 'Account'},
+                {'name': 'Currency', 'id': 'Currency'},
+                {'name': 'Amount', 'id': 'Amount'},
+                {'name': 'Amount (Raw)', 'id': 'Amount Raw', 'type': 'numeric', 'format': {'specifier': ',.2f'}},
+                {'name': 'Balance', 'id': 'Balance'},
+                {'name': 'Balance (Raw)', 'id': 'Balance Raw', 'type': 'numeric', 'format': {'specifier': ',.2f'}},
+                {'name': 'CR/DR', 'id': 'CR/DR'},
+                {'name': 'Description 1', 'id': 'Description 1'},
+                {'name': 'Description 2', 'id': 'Description 2'},
+                {'name': 'Description 3', 'id': 'Description 3'},
+                {'name': 'Merchant', 'id': 'Merchant'},
+                {'name': 'Category', 'id': 'Category'},
+                {'name': 'Month', 'id': 'Month'},
+            ],
+            data=transactions_data,
+            style_cell={
+                'backgroundColor': 'rgba(255, 255, 255, 0.05)',
+                'color': '#ffffff',
+                'border': '1px solid rgba(255, 255, 255, 0.1)',
+                'textAlign': 'left',
+                'padding': '0.75rem',
+                'fontFamily': 'Inter',
+                'fontSize': '0.875rem',
+                'whiteSpace': 'normal',
+                'height': 'auto'
+            },
+            style_header={
+                'backgroundColor': 'rgba(102, 126, 234, 0.2)',
+                'fontWeight': '600',
+                'border': '1px solid rgba(102, 126, 234, 0.3)'
+            },
+            style_data_conditional=[
+                {
+                    'if': {'row_index': 'odd'},
+                    'backgroundColor': 'rgba(255, 255, 255, 0.02)'
+                },
+                {
+                    'if': {'filter_query': '{CR/DR} = CR'},
+                    'color': '#2ecc71'
+                },
+                {
+                    'if': {'filter_query': '{CR/DR} = DR'},
+                    'color': '#e74c3c'
+                }
+            ],
+            style_table={'borderRadius': '1rem', 'overflow': 'hidden', 'marginTop': '1rem'},
+            page_size=50,
+            page_action='native',
+            sort_action='native',
+            filter_action='native',
+            style_data={
+                'whiteSpace': 'normal',
+                'height': 'auto',
+                'lineHeight': '1.4'
+            },
+            tooltip_data=[
+                {
+                    column: {'value': str(value), 'type': 'markdown'}
+                    for column, value in row.items()
+                } for row in transactions_data
+            ],
+            tooltip_duration=None
+        )
+    ])
+
+# Transactions page callback
+@app.callback(
+    Output('transactions-table', 'data'),
+    Input('transactions-statement-filter', 'value'),
+    Input('transactions-currency-filter', 'value'),
+    Input('transactions-crdr-filter', 'value')
+)
+def update_transactions_table(statement_id, currency, cr_dr):
+    """Update transactions table based on filters"""
+    all_transactions = db.get_transactions()
+    
+    if all_transactions.empty:
+        return []
+    
+    # Apply filters - handle empty string as "no filter"
+    filtered = all_transactions.copy()
+    
+    if statement_id and statement_id != '':
+        filtered = filtered[filtered['statement_id'] == statement_id]
+    
+    if currency and currency != '':
+        statements = db.get_statements()
+        statement_dict = {s.id: s for s in statements}
+        filtered['currency'] = filtered['statement_id'].map(
+            lambda x: getattr(statement_dict.get(x, None), 'currency', 'ZAR') if statement_dict.get(x) else 'ZAR'
+        )
+        filtered = filtered[filtered['currency'] == currency]
+    
+    if cr_dr and cr_dr != '':
+        filtered = filtered[filtered['cr_dr_indicator'] == cr_dr]
+    
+    if filtered.empty:
+        return []
+    
+    # Add statement info
+    statements = db.get_statements()
+    statement_dict = {s.id: s for s in statements}
+    filtered['account_name'] = filtered['statement_id'].map(
+        lambda x: statement_dict.get(x, None).account_name if statement_dict.get(x) else 'Unknown'
+    )
+    filtered['currency'] = filtered['statement_id'].map(
+        lambda x: getattr(statement_dict.get(x, None), 'currency', 'ZAR') if statement_dict.get(x) else 'ZAR'
+    )
+    
+    # Prepare data
+    transactions_data = []
+    for idx, row in filtered.iterrows():
+        curr = row.get('currency', 'ZAR')
+        # Get raw numeric values - use direct column access
+        raw_amount = float(row['amount']) if pd.notna(row.get('amount', None)) else 0.0
+        raw_balance = float(row['balance']) if pd.notna(row.get('balance', None)) else 0.0
+        
+        transactions_data.append({
+            'ID': int(row.get('id', 0)) if pd.notna(row.get('id')) else 0,
+            'Statement ID': int(row.get('statement_id', 0)) if pd.notna(row.get('statement_id')) else 0,
+            'Account': row.get('account_name', 'Unknown'),
+            'Currency': curr,
+            'Date': pd.to_datetime(row['date']).strftime('%Y-%m-%d') if pd.notna(row['date']) else '',
+            'Amount': format_currency(raw_amount, curr),
+            'Amount Raw': raw_amount,  # Raw numeric value for debugging
+            'Balance': format_currency(raw_balance, curr),
+            'Balance Raw': raw_balance,  # Raw numeric value for debugging
+            'CR/DR': row.get('cr_dr_indicator', ''),
+            'Description 1': str(row.get('description_1', ''))[:100] if pd.notna(row.get('description_1')) else '',
+            'Description 2': str(row.get('description_2', ''))[:100] if pd.notna(row.get('description_2')) else '',
+            'Description 3': str(row.get('description_3', ''))[:100] if pd.notna(row.get('description_3')) else '',
+            'Merchant': str(row.get('merchant', ''))[:100] if pd.notna(row.get('merchant')) else '',
+            'Category': str(row.get('merchant_category', '')) if pd.notna(row.get('merchant_category')) else '',
+            'Month': row.get('month_year', ''),
+        })
+    
+    return transactions_data
+
 # Callback for page routing
 @app.callback(Output('page-content', 'children'),
               Input('url', 'pathname'))
@@ -744,6 +1016,8 @@ def display_page(pathname):
         return create_history_page()
     elif pathname == '/wealth':
         return create_wealth_page()
+    elif pathname == '/transactions':
+        return create_transactions_page()
     else:
         return create_dashboard_page()
 

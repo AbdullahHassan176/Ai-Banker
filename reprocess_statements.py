@@ -103,9 +103,28 @@ def reprocess_statement(statement_id, file_path):
         finally:
             session.close()
         
-        # Save transactions
+        # Save transactions - force update by deleting all existing first
         print("  [4/6] Saving transactions...", end="", flush=True)
         save_start = time.time()
+        
+        # Force delete all existing transactions for this statement in a new session
+        from src.database.models import get_session, Transaction
+        session = get_session()
+        try:
+            # Force delete all transactions for this statement
+            deleted_count = session.query(Transaction).filter(
+                Transaction.statement_id == statement_id
+            ).delete(synchronize_session=False)
+            session.commit()
+            if deleted_count > 0:
+                print(f" [DELETED {deleted_count} old transactions]", end="", flush=True)
+        except Exception as e:
+            session.rollback()
+            print(f" [WARN] Error deleting old transactions: {e}", end="", flush=True)
+        finally:
+            session.close()
+        
+        # Now add all transactions as new (no duplicates should exist)
         db.add_transactions(statement_id, df)
         save_time = time.time() - save_start
         print(f" [OK] Saved {len(df)} transactions (took {save_time:.1f}s)")

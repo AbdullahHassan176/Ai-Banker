@@ -67,8 +67,9 @@ class DBManager:
             ).all()
             
             # Create a set of existing transaction keys (date, amount, description_1)
+            # Use a more lenient key that includes balance to better detect true duplicates
             existing_keys = {
-                (t.date, round(float(t.amount), 2), (t.description_1 or '')[:50])
+                (t.date, round(float(t.amount), 2), round(float(t.balance), 2), (t.description_1 or '')[:50])
                 for t in existing_transactions
             }
             
@@ -129,9 +130,9 @@ class DBManager:
                 # Handle both column names for backward compatibility
                 cr_dr = row.get('cr_dr_indicator') or row.get('cr_dr_ind', 'DR')
                 
-                # Check for duplicate: same date, amount (rounded to 2 decimals), and description
+                # Check for duplicate: same date, amount, balance (rounded to 2 decimals), and description
                 trns_date = pd.to_datetime(row['trns_date'])
-                duplicate_key = (trns_date, round(amount, 2), (description_1 or '')[:50])
+                duplicate_key = (trns_date, round(amount, 2), round(balance, 2), (description_1 or '')[:50])
                 
                 if duplicate_key in existing_keys:
                     skipped_count += 1

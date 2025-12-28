@@ -11,7 +11,15 @@ import warnings
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.utils.data_cleaning import clean_amount, extract_merchant, determine_cr_dr
+from src.utils.data_cleaning import clean_amount, extract_merchant, determine_cr_dr, extract_amount_from_description
+
+# Try to import transaction validator (optional - will gracefully degrade if Ollama not available)
+try:
+    from src.ai.transaction_validator import TransactionValidator
+    VALIDATOR_AVAILABLE = True
+except ImportError:
+    VALIDATOR_AVAILABLE = False
+    TransactionValidator = None
 
 warnings.filterwarnings("ignore")
 
@@ -76,22 +84,56 @@ def parse_pdf(file_path: str, account_name: str = None):
     seen_row_hashes = set()  # Track seen rows to avoid duplicates across pages
     
     for dfs in df_list:
-        # Remove columns with too many nulls
-        dfs = dfs[dfs.columns[dfs.isnull().mean() < 0.8]]
+        # Remove columns with too many nulls, but be smarter about it
+        # Keep columns that have numeric data even if they have many nulls (like balance columns)
+        cols_to_keep = []
+        for col_idx in range(dfs.shape[1]):
+            col = dfs.iloc[:, col_idx]
+            null_pct = col.isnull().mean()
+            
+            # Check if column contains numeric data (amounts, balances)
+            has_numeric = col.astype(str).str.contains(r'\d+[.,]\d+', na=False, regex=True).any()
+            
+            # Keep column if:
+            # 1. Less than 80% nulls (normal case), OR
+            # 2. Has numeric data (likely amount/balance column even with many nulls in headers)
+            if null_pct < 0.8 or has_numeric:
+                cols_to_keep.append(col_idx)
+        
+        if cols_to_keep:
+            dfs = dfs.iloc[:, cols_to_keep]
+        else:
+            # Fallback: keep all columns if our logic removed everything
+            pass
+        
         # Drop rows with too few non-null values
         dfs = dfs.dropna(axis=0, thresh=2)
         
         if dfs.empty:
             continue
         
-        # Handle columns - remove extra columns if more than 6
-        if dfs.shape[1] > 6:
-            # Remove last columns until we have 6 or fewer
+        # Handle columns - for 7 columns, check if last column is empty/useless
+        # Structure is usually: date, desc1, desc2, desc3, amount, balance, extra
+        # We want to keep: date, desc1, desc2, desc3, amount, balance
+        if dfs.shape[1] == 7:
+            # Check if last column is mostly empty or contains non-numeric data
+            last_col = dfs.iloc[:, -1]
+            last_col_non_null = last_col.notna().sum()
+            # If last column is mostly empty (less than 10% non-null), drop it
+            if last_col_non_null < len(dfs) * 0.1:
+                dfs = dfs.drop(dfs.columns[-1], axis=1)
+            # Otherwise, check if it looks like balance data (contains numbers)
+            else:
+                # Check if column 5 (index 5) looks more like balance (has more numeric values)
+                col5_numeric = dfs.iloc[:, 5].astype(str).str.contains(r'\d+\.?\d*', na=False).sum()
+                col6_numeric = dfs.iloc[:, 6].astype(str).str.contains(r'\d+\.?\d*', na=False).sum()
+                # If column 6 has fewer numbers, it's likely the extra column
+                if col6_numeric < col5_numeric:
+                    dfs = dfs.drop(dfs.columns[-1], axis=1)
+        elif dfs.shape[1] > 7:
+            # For more than 7 columns, drop last columns until we have 6
             while dfs.shape[1] > 6:
                 dfs = dfs.drop(dfs.columns[-1], axis=1)
-        elif dfs.shape[1] == 7:
-            # For 7 columns, drop the last one
-            dfs = dfs.drop(dfs.columns[-1], axis=1)
         
         if dfs.shape[1] >= 4:  # Need at least 4 columns
             # Create a hash of each row to detect duplicates across pages
@@ -187,24 +229,102 @@ def parse_pdf(file_path: str, account_name: str = None):
     start_date = df_fin['trns_date'].min()
     end_date = df_fin['trns_date'].max()
     
-    # Extract balances
-    bal_s = df_fin['balance'].iloc[0] if not df_fin.empty else 0.0
-    bal_e = df_fin['balance'].iloc[-1] if not df_fin.empty else 0.0
+    # Extract opening and closing balances (before we calculate amounts from differences)
+    # We'll get these after cleaning, but before calculating amounts
+    bal_s = None
+    bal_e = None
     
-    # Clean balances
-    if pd.isna(bal_s):
-        bal_s = 0.0
-    else:
-        bal_s = clean_amount(bal_s)
-    
-    if pd.isna(bal_e):
-        bal_e = 0.0
-    else:
-        bal_e = clean_amount(bal_e)
-    
-    # Clean amounts
+    # Clean amounts and balances
     df_fin['amount_cleaned'] = df_fin['amount'].apply(clean_amount)
     df_fin['balance_cleaned'] = df_fin['balance'].apply(clean_amount)
+    
+    # Convert to numeric
+    df_fin['amount_cleaned'] = pd.to_numeric(df_fin['amount_cleaned'], errors='coerce')
+    df_fin['balance_cleaned'] = pd.to_numeric(df_fin['balance_cleaned'], errors='coerce')
+    
+    # Sort by date to ensure correct order for balance calculations
+    df_fin = df_fin.sort_values('trns_date').reset_index(drop=True)
+    
+    # CRITICAL FIX: Calculate transaction amounts from balance changes, not from the "amount" column
+    # The "amount" column in PDFs often contains the balance, not the transaction amount
+    # Transaction amount = absolute difference between consecutive balances
+    
+    # First, detect if amount column actually contains balance values
+    # If amount equals balance for most rows, the columns are likely swapped or amount contains balances
+    amount_equals_balance = (df_fin['amount_cleaned'] == df_fin['balance_cleaned']).sum()
+    pct_match = amount_equals_balance / len(df_fin) if len(df_fin) > 0 else 0
+    
+    # If more than 50% of amounts equal balances, the "amount" column likely contains balances
+    if pct_match > 0.5:
+        print(f"WARNING: {pct_match*100:.1f}% of amounts equal balances. 'Amount' column likely contains balance values.")
+        # Swap: use balance_cleaned as the source for calculating amounts, and amount_cleaned as balance
+        # Actually, if they're equal, we need to use balance_cleaned to calculate differences
+        # But first, let's check if balance_cleaned has valid data
+        if df_fin['balance_cleaned'].notna().sum() < 2:
+            # Balance column is empty, so amount column might actually be the balance
+            print("Balance column is empty. Treating 'amount' column as balance column.")
+            df_fin['balance_cleaned'] = df_fin['amount_cleaned'].copy()
+    
+    # Check if we have valid balance data
+    valid_balances = df_fin['balance_cleaned'].notna() & (df_fin['balance_cleaned'] != 0)
+    has_valid_balances = valid_balances.sum() > 1  # Need at least 2 valid balances to calculate differences
+    
+    if has_valid_balances:
+        # Calculate amounts from balance differences
+        df_fin['balance_diff'] = df_fin['balance_cleaned'].diff().abs()
+        df_fin['balance_change'] = df_fin['balance_cleaned'].diff()
+        
+        # Replace amount_cleaned with balance_diff for all rows where we can calculate it
+        mask_calculable = df_fin['balance_diff'].notna() & (df_fin['balance_diff'] > 0)
+        df_fin.loc[mask_calculable, 'amount_cleaned'] = df_fin.loc[mask_calculable, 'balance_diff']
+        
+        # For rows where balance_diff is not available (first row), try to use original amount
+        # But if original amount equals balance, it's likely wrong - use a small default or calculate from first balance
+        mask_first_row = ~mask_calculable
+        if mask_first_row.any():
+            first_row_mask = mask_first_row & (df_fin['amount_cleaned'] == df_fin['balance_cleaned'])
+            # For first transaction, if amount equals balance, try to estimate from first balance
+            # If first balance is available, use it as a starting point
+            if first_row_mask.any() and df_fin['balance_cleaned'].iloc[0] > 0:
+                # Can't calculate first amount without opening balance, so keep original or set to 0
+                df_fin.loc[first_row_mask, 'amount_cleaned'] = 0.0
+    else:
+        # No valid balances - this means balance column wasn't parsed correctly
+        # In this case, we need to detect if amount column actually contains balances
+        # If amount values are very large (like account balances), they're likely wrong
+        print("WARNING: Balance column not parsed correctly. Amounts may be incorrect.")
+        
+        # Try to detect if amount column contains balance values by checking if they're too large
+        # or if they match a pattern of running balances (monotonically increasing/decreasing)
+        amount_values = df_fin['amount_cleaned'].abs()
+        if len(amount_values) > 5:
+            # Check if amounts look like balances (very large, or following a pattern)
+            median_amount = amount_values.median()
+            # If median is very large (>100k), likely balances not amounts
+            if median_amount > 100000:
+                print(f"WARNING: Amounts appear to be balance values (median: {median_amount:,.2f}). Cannot calculate transaction amounts without balance column.")
+                # Set amounts to 0 as we can't determine them
+                df_fin['amount_cleaned'] = 0.0
+            # If amounts equal balances exactly, they're wrong
+            elif (df_fin['amount_cleaned'] == df_fin['balance_cleaned']).all():
+                print("WARNING: All amounts equal balances. This indicates parsing error.")
+                df_fin['amount_cleaned'] = 0.0
+        
+        # Set balance_change to None since we can't calculate it
+        df_fin['balance_change'] = None
+    
+    # Store calculated CR/DR based on balance direction
+    df_fin['calculated_cr_dr'] = df_fin['balance_change'].apply(
+        lambda x: 'CR' if pd.notna(x) and x > 0 else ('DR' if pd.notna(x) and x < 0 else None)
+    )
+    
+    # Extract opening and closing balances (after cleaning and sorting)
+    if not df_fin.empty:
+        bal_s = float(df_fin['balance_cleaned'].iloc[0]) if pd.notna(df_fin['balance_cleaned'].iloc[0]) else 0.0
+        bal_e = float(df_fin['balance_cleaned'].iloc[-1]) if pd.notna(df_fin['balance_cleaned'].iloc[-1]) else 0.0
+    else:
+        bal_s = 0.0
+        bal_e = 0.0
     
     # Filter out rows where description contains balance-related keywords
     balance_keywords = ['opening balance', 'closing balance', 'brought forward', 'carried forward', 
@@ -271,8 +391,85 @@ def parse_pdf(file_path: str, account_name: str = None):
     if df_fin.empty:
         raise Exception("No valid transactions found after deduplication")
     
-    # Determine CR/DR
-    df_fin['cr_dr_indicator'] = df_fin['amount'].apply(determine_cr_dr)
+    # Extract amounts from descriptions for rows where amount is missing or zero
+    # This helps fill in amounts that weren't properly parsed from the amount column
+    df_fin['desc_extracted_amount'] = None
+    df_fin['desc_extracted_cr_dr'] = None
+    
+    for idx, row in df_fin.iterrows():
+        amount = row.get('amount_cleaned', 0.0)
+        # If amount is missing, zero, or suspiciously large (likely a balance), try to extract from descriptions
+        if pd.isna(amount) or amount == 0.0 or (abs(amount) > 1_000_000 and abs(amount) == abs(row.get('balance_cleaned', 0.0))):
+            desc_amount, desc_cr_dr = extract_amount_from_description(
+                row.get('trns_desc_1'),
+                row.get('trns_desc_2'),
+                row.get('trns_desc_3')
+            )
+            if desc_amount is not None and desc_amount > 0:
+                df_fin.at[idx, 'desc_extracted_amount'] = desc_amount
+                df_fin.at[idx, 'desc_extracted_cr_dr'] = desc_cr_dr
+    
+    # Update amount_cleaned with extracted amounts where original was missing/zero
+    mask_missing_amount = (df_fin['amount_cleaned'].isna()) | (df_fin['amount_cleaned'] == 0.0) | (
+        (df_fin['amount_cleaned'].abs() > 1_000_000) & 
+        (df_fin['amount_cleaned'].abs() == df_fin['balance_cleaned'].abs())
+    )
+    mask_has_extracted = df_fin['desc_extracted_amount'].notna() & (df_fin['desc_extracted_amount'] > 0)
+    
+    fill_mask = mask_missing_amount & mask_has_extracted
+    if fill_mask.any():
+        filled_count = fill_mask.sum()
+        print(f"Filled {filled_count} missing/zero amounts from description columns")
+        df_fin.loc[fill_mask, 'amount_cleaned'] = df_fin.loc[fill_mask, 'desc_extracted_amount']
+    
+    # Determine CR/DR - use calculated CR/DR from balance changes if available, 
+    # then extracted CR/DR from descriptions, otherwise use original method
+    if 'calculated_cr_dr' in df_fin.columns:
+        # Start with calculated CR/DR from balance changes
+        df_fin['cr_dr_indicator'] = df_fin['calculated_cr_dr'].copy()
+        
+        # Fill missing with extracted CR/DR from descriptions
+        mask_missing_cr_dr = df_fin['cr_dr_indicator'].isna()
+        mask_has_extracted_cr_dr = df_fin['desc_extracted_cr_dr'].notna()
+        df_fin.loc[mask_missing_cr_dr & mask_has_extracted_cr_dr, 'cr_dr_indicator'] = \
+            df_fin.loc[mask_missing_cr_dr & mask_has_extracted_cr_dr, 'desc_extracted_cr_dr']
+        
+        # Fill remaining missing with original method
+        mask_still_missing = df_fin['cr_dr_indicator'].isna()
+        if mask_still_missing.any():
+            df_fin.loc[mask_still_missing, 'cr_dr_indicator'] = \
+                df_fin.loc[mask_still_missing, 'amount'].apply(determine_cr_dr)
+    else:
+        # No calculated CR/DR, use extracted or original
+        df_fin['cr_dr_indicator'] = df_fin['desc_extracted_cr_dr'].fillna(
+            df_fin['amount'].apply(determine_cr_dr)
+        )
+    
+    # Validate transactions using AI (Ollama) - especially for transactions where amounts were extracted from descriptions
+    import config
+    if (VALIDATOR_AVAILABLE and TransactionValidator and 
+        getattr(config, 'AI_TRANSACTION_VALIDATION_ENABLED', True)):
+        try:
+            validator = TransactionValidator()
+            # Only validate transactions where we extracted amounts from descriptions or where amounts seem suspicious
+            df_fin = validator.validate_batch(df_fin, validate_all=False)
+            print("AI validation completed")
+        except Exception as e:
+            print(f"Warning: Transaction validation failed: {e}. Continuing without validation.")
+    
+    # Clean up temporary columns
+    if 'desc_extracted_amount' in df_fin.columns:
+        df_fin = df_fin.drop('desc_extracted_amount', axis=1)
+    if 'desc_extracted_cr_dr' in df_fin.columns:
+        df_fin = df_fin.drop('desc_extracted_cr_dr', axis=1)
+    
+    # Clean up temporary columns
+    if 'balance_diff' in df_fin.columns:
+        df_fin = df_fin.drop('balance_diff', axis=1)
+    if 'balance_change' in df_fin.columns:
+        df_fin = df_fin.drop('balance_change', axis=1)
+    if 'calculated_cr_dr' in df_fin.columns:
+        df_fin = df_fin.drop('calculated_cr_dr', axis=1)
     
     # Extract merchant
     df_fin['merchant'] = df_fin.apply(
